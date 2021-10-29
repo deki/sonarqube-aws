@@ -1,0 +1,370 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: An example CloudFormation template to deploy SonarQube on ECS Fargate along with a RDS PostgresQL.
+Parameters:
+  VPC:
+    Type: AWS::EC2::VPC::Id
+  Subnet1:
+    Type: AWS::EC2::Subnet::Id
+  Subnet2:
+    Type: AWS::EC2::Subnet::Id
+# uncomment to allow HTTPS instead of HTTP
+#  Certificate:
+#    Type: String
+#    # Update with the certificate ARN from Certificate Manager, which must exist in the same region.
+#    Default: 'arn:aws:acm:region:123456789010:certificate/00000000-0000-0000-0000-000000000000'
+  Image:
+    Type: String
+    Default: sonarqube:lts-community  # sonarqube:8.9.2-community
+  ServiceName:
+    Type: String
+    Default: SonarQubeService
+  ContainerPort:
+    Type: Number
+    Default: 9000
+  LoadBalancerPort:
+    Type: Number
+    Default: 80 # change to 443 for HTTPS
+  DatabaseName:
+    Type: String
+    Default: sonarqube
+  DatabasePort:
+    Type: Number
+    Default: 5432
+  HealthCheckPath:
+    Type: String
+    Default: /api/system/status
+#  HostedZoneName:
+#    Type: String
+#    Default: company.com
+#  Subdomain:
+#    Type: String
+#    Default: sonarqube
+  PosixUserIdentifier:
+    Type: Number
+    Default: 1000
+  PosixGroupIdentifier:
+    Type: Number
+    Default: 1000
+Resources:
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Join ['', [!Ref ServiceName, Cluster]]
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    # log group needs to be created before it is used.
+    DependsOn: LogGroup
+    Properties:
+      # Name for the task definition
+      Family: !Join ['', [!Ref ServiceName, TaskDefinition]]
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 2048
+      Memory: 4GB
+      # "The ARN of the task execution role that containers in this task can assume. All containers in this task are granted the permissions that are specified in this role."
+      # "There is an optional task execution IAM role that you can specify with Fargate to allow your Fargate tasks to make API calls to Amazon ECR."
+      ExecutionRoleArn: !Ref ExecutionRole
+      # "The Amazon Resource Name (ARN) of an AWS Identity and Access Management (IAM) role that grants containers in the task permission to call AWS APIs on your behalf."
+      TaskRoleArn: !Ref TaskRole
+      ContainerDefinitions:
+        - Name: !Ref ServiceName
+          Image: !Ref Image
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+          User: !Join ['', [!Ref PosixUserIdentifier, ':', !Ref PosixGroupIdentifier]]
+          Environment:
+            - Name: SONAR_JDBC_URL
+              Value: !Join [ '', [ 'jdbc:postgresql://', !GetAtt [ SonarQubeDatabase, Endpoint.Address ], ':', !GetAtt [SonarQubeDatabase, Endpoint.Port ], '/', !Ref DatabaseName ] ] # PostgreSQL database JDBC connection url
+            - Name: SONAR_JDBC_USERNAME
+              Value:
+                Fn::Sub: "{{resolve:secretsmanager:${SonarQubeDatabaseSecret}::username}}" # PostgreSQL database user name
+            - Name: SONAR_JDBC_PASSWORD
+              Value:
+                Fn::Sub: "{{resolve:secretsmanager:${SonarQubeDatabaseSecret}::password}}" # PostgreSQL database user password
+              # additional variables: https://docs.sonarqube.org/latest/setup/environment-variables/
+          Ulimits:
+            - Name: nofile
+              SoftLimit: 65535
+              HardLimit: 131072
+          Command: [ '-Dsonar.search.javaAdditionalOpts=-Dnode.store.allow_mmap=false' ]
+          MountPoints:
+            - SourceVolume: sonarqube-data
+              ContainerPath: '/opt/sonarqube/data'
+              ReadOnly: false
+            - SourceVolume: sonarqube-logs
+              ContainerPath: '/opt/sonarqube/logs'
+              ReadOnly: false
+            - SourceVolume: sonarqube-extensions
+              ContainerPath: '/opt/sonarqube/extensions'
+              ReadOnly: false
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref LogGroup
+              awslogs-stream-prefix: ecs
+      Volumes:
+        - Name: sonarqube-data
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref SonarQubeEFSVolume
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref SonarQubeEFSAccessPointData
+        - Name: sonarqube-logs
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref SonarQubeEFSVolume
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref SonarQubeEFSAccessPointLogs
+        - Name: sonarqube-extensions
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref SonarQubeEFSVolume
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref SonarQubeEFSAccessPointExtensions
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ['', [!Ref ServiceName, !Ref "AWS::Region", ExecutionRole]]
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ['', [!Ref ServiceName, !Ref "AWS::Region", TaskRole]]
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      # ManagedPolicyArns:
+      #   -
+      # Policies:
+      #   -
+  ContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Join ['', [!Ref ServiceName, ContainerSecurityGroup]]
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Join ['', [!Ref ServiceName, LoadBalancerSecurityGroup]]
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref LoadBalancerPort
+          ToPort: !Ref LoadBalancerPort
+          CidrIp: 0.0.0.0/0
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ListenerHTTP
+    Properties:
+      ServiceName: !Ref ServiceName
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1 #
+      HealthCheckGracePeriodSeconds: 150
+      LaunchType: FARGATE
+      # requires additional ssmmessages policy, see https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-exec.html#ecs-exec-enabling-and-using
+      EnableExecuteCommand: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          # can be changed to DISABLED if using private subnets that have access to a NAT gateway
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref Subnet1
+            - !Ref Subnet2
+          SecurityGroups:
+            - !Ref ContainerSecurityGroup
+      LoadBalancers:
+        - ContainerName: !Ref ServiceName
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthyThresholdCount: 2
+      Name: !Join ['', [!Ref ServiceName, TargetGroup]]
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: true
+      TargetType: ip
+      VpcId: !Ref VPC
+  ListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: !Ref LoadBalancerPort
+      Protocol: HTTP
+#      Protocol: HTTPS
+#      Certificates:
+#        - CertificateArn: !Ref Certificate
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Join ['', [!Ref ServiceName, LoadBalancer]]
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Subnets:
+        - !Ref Subnet1
+        - !Ref Subnet2
+#  DNSRecord:
+#    Type: AWS::Route53::RecordSet
+#    Properties:
+#      HostedZoneName: !Join ['', [!Ref HostedZoneName, .]]
+#      Name: !Join ['', [!Ref Subdomain, ., !Ref HostedZoneName, .]]
+#      Type: A
+#      AliasTarget:
+#        DNSName: !GetAtt LoadBalancer.DNSName
+#        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', [!Ref ServiceName, TaskDefinition]]
+  SonarQubeEFSVolume:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-efs-vol"
+  SonarQubeEFSAccessPointData:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref SonarQubeEFSVolume
+      PosixUser:
+        Uid: !Ref PosixUserIdentifier
+        Gid: !Ref PosixGroupIdentifier
+      RootDirectory:
+        CreationInfo:
+          OwnerGid: !Ref PosixGroupIdentifier
+          OwnerUid: !Ref PosixUserIdentifier
+          Permissions: "0700"
+        Path: "/data"
+  SonarQubeEFSAccessPointLogs:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref SonarQubeEFSVolume
+      PosixUser:
+        Uid: !Ref PosixUserIdentifier
+        Gid: !Ref PosixGroupIdentifier
+      RootDirectory:
+        CreationInfo:
+          OwnerGid: !Ref PosixGroupIdentifier
+          OwnerUid: !Ref PosixUserIdentifier
+          Permissions: "0755"
+        Path: "/logs"
+  SonarQubeEFSAccessPointExtensions:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref SonarQubeEFSVolume
+      PosixUser:
+        Uid: !Ref PosixUserIdentifier
+        Gid: !Ref PosixGroupIdentifier
+      RootDirectory:
+        CreationInfo:
+          OwnerGid: !Ref PosixGroupIdentifier
+          OwnerUid: !Ref PosixUserIdentifier
+          Permissions: "0700"
+        Path: "/extensions"
+  SonarQubeEFSServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${AWS::StackName}-efs-server-endpoints"
+      GroupDescription: Ingress for EFS server endpoints for SonarQube mount
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref ContainerSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-efs-server"
+  SonarQubeEFSMountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref SonarQubeEFSVolume
+      SecurityGroups:
+        - !Ref SonarQubeEFSServerSecurityGroup
+      SubnetId: !Ref Subnet1
+  SonarQubeEFSMountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref SonarQubeEFSVolume
+      SecurityGroups:
+        - !Ref SonarQubeEFSServerSecurityGroup
+      SubnetId: !Ref Subnet2
+  SonarQubeDatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Secret for SonarQube database
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "sonarqube"}'
+        GenerateStringKey: password
+        PasswordLength: 16
+        ExcludeCharacters: "\"@/\\"
+  SonarQubeDatabase:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBSubnetGroupName: !Ref SonarQubeDatabaseSubnetGroup
+      DBName: !Ref DatabaseName
+      VPCSecurityGroups:
+        - Ref: SonarQubeDatabaseSecurityGroup
+      AllocatedStorage: '20'
+      DBInstanceClass: db.t3.micro
+      Port: !Ref DatabasePort
+      Engine: postgres
+      EngineVersion: 13.4
+      MasterUsername:
+        Fn::Sub: "{{resolve:secretsmanager:${SonarQubeDatabaseSecret}::username}}"
+      MasterUserPassword:
+        Fn::Sub: "{{resolve:secretsmanager:${SonarQubeDatabaseSecret}::password}}"
+    DeletionPolicy: Snapshot
+  SonarQubeDatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: SonarQube database subnet group
+      SubnetIds:
+        - !Ref Subnet1
+        - !Ref Subnet2
+  SonarQubeDatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Ingress for SonarQube database
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref DatabasePort
+          ToPort: !Ref DatabasePort
+          SourceSecurityGroupId: !Ref ContainerSecurityGroup
+Outputs:
+  LoadBalancerUrl:
+    Description: The URL of the loadbalancer
+    Value: !GetAtt LoadBalancer.DNSName
+#  Endpoint:
+#    Description: Endpoint
+#    Value: !Join ['', ['https://', !Ref DNSRecord]]
